@@ -70,6 +70,10 @@
 #define HAS_PINVOKE 1 // pinvoke (for dlopen/dlsym) support
 #endif
 
+#ifndef HAS_STRFTIME
+#define HAS_STRFTIME 1
+#endif
+
 #ifndef EMBEDDED_VM   // use as embedded vm in project
 #define EMBEDDED_VM 0
 #endif
@@ -1016,19 +1020,21 @@ void set_blocking(int sock, int blockp) {
 #endif
 }
 
+#if 0
 #ifndef _WIN32
 static
 void signal_handler(int signal) {
 	fprintf(stderr, "signal %d!\n", signal);
-   switch(signal) {
-      case SIGINT:
-         breaked |= 2; break;
+	switch(signal) {
+//      case SIGINT:
+//        breaked |= 2; break;
       case SIGPIPE: break; // can cause loop when reporting errors
       default:
          // printf("vm: signal %d\n", signal);
          breaked |= 4;
    }
 }
+#endif
 #endif
 
 /* small functions defined locally after hitting some portability issues */
@@ -1041,15 +1047,11 @@ unsigned int lenn(char *pos, size_t max) { // added here, strnlen was missing in
 	return p;
 }
 
-void set_signal_handler() {
-
+void set_signal_handler()
+{
 #ifndef _WIN32
-//   struct sigaction sa;
-//   sa.sa_handler = signal_handler;
-//   sigemptyset(&sa.sa_mask);
-// sa.sa_flags = SA_RESTART;
-   signal(SIGINT, signal_handler);
-   signal(SIGPIPE, signal_handler);
+//	signal(SIGINT, signal_handler);
+	signal(SIGPIPE, SIG_IGN);
 #endif
 }
 
@@ -1402,6 +1404,9 @@ invoke:; // nargs and regs ready, maybe gc and execute ob
 
 #		define SYSCALL_IOCTL 16
 #		define SYSCALL_IOCTL_TIOCGETA 19
+
+#		define SYSCALL_GETTIMEOFDATE 96
+#		define SYSCALL_TIME 201
 
 
 	// tuples, trees
@@ -2267,7 +2272,8 @@ invoke:; // nargs and regs ready, maybe gc and execute ob
 
 			// ==================================================
 			//  network part:
-
+			//
+			// http://www.kegel.com/c10k.html
 #if HAS_SOCKETS
 			// SOCKET
 			case 41: { // socket (todo: options: STREAM or DGRAM)
@@ -2363,8 +2369,36 @@ invoke:; // nargs and regs ready, maybe gc and execute ob
 				socklen_t len = sizeof(addr);
 				int sock = accept(sockfd, (struct sockaddr *)&addr, &len);
 				// On error, -1 is returned
-				if (sock >= 0)
+				if (sock < 0)
+					break;
+#if _WIN32
+				unsigned long mode = blocking ? 0 : 1;
+				if (ioctlsocket(fd, FIONBIO, &mode) == 0)
+#else
+				int flags = fcntl(sock, F_GETFL, 0);
+				if (flags < 0)
+					break;
+				flags = (flags | O_NONBLOCK);
+				if (fcntl(sock, F_SETFL, flags) == 0)
+#endif
 					result = (word) new_port (sock);
+				break;
+			}
+
+			// SELECT
+			// http://linux.die.net/man/2/select
+			case 23: { // (select sockfd)
+				CHECK(is_port(a), a, SYSCALL);
+				int sockfd = car (a);
+
+				struct timeval timeout = { 0, 100 }; // 100ms
+				fd_set fds;
+				FD_ZERO(&fds); FD_SET(sockfd, &fds);
+
+				if (select(FD_SETSIZE, &fds, NULL, NULL, &timeout) != -1
+						&& FD_ISSET(sockfd, &fds))
+					result = ITRUE;
+
 				break;
 			}
 
@@ -2501,6 +2535,39 @@ invoke:; // nargs and regs ready, maybe gc and execute ob
 				break;
 			}
 
+			case SYSCALL_GETTIMEOFDATE: {
+				struct timeval tv;
+				if (gettimeofday(&tv, NULL) == 0)
+					result = (word) new_list (TPAIR,
+							(tv.tv_sec > FMAX)
+								?	(word) new_list(TINT, F(tv.tv_sec & FMAX), F(tv.tv_sec >> FBITS))
+								:	F(tv.tv_sec),
+							F(tv.tv_usec));
+				break;
+			}
+
+			// syscall (time format seconds #f)
+			//	if formet - return string, else seconds
+			//	if seconds == false, get current seconds
+			case SYSCALL_TIME: {
+				word B = b;
+				time_t seconds = B == IFALSE ? time(NULL) : uftoi(B);
+#if HAS_STRFTIME
+				word* A = (word*) a;
+				if (is_string(A)) {
+					char* ptr = (char*) &fp[1];
+					struct tm tm = *localtime(&seconds);
+					size_t len = strftime(ptr, (size_t) (heap->end - fp - MEMPAD), (char*)&A[1], &tm);
+					result = (word) new_bytevector(len+1, TSTRING);
+				}
+				else
+#endif
+					result = (seconds > FMAX)
+							?	(word)new_list(TINT, F(seconds & FMAX), F(seconds >> FBITS))
+							:	F(seconds);
+				break;
+			}
+
 			// EXIT errorcode
 			// http://linux.die.net/man/2/exit
 			// exit - cause normal process termination, function does not return.
@@ -2540,7 +2607,8 @@ invoke:; // nargs and regs ready, maybe gc and execute ob
 			}
 
 
-			// other commands
+			// =- 1000+ -===========================================================================
+			// other internal commands
 
 			// todo: сюда надо перенести все prim_sys операции, что зависят от глобальных переменных
 			//  остальное можно спокойно оформлять отдельными функциями
@@ -2554,18 +2622,30 @@ invoke:; // nargs and regs ready, maybe gc and execute ob
 					break;
 
 				case 1008: /* get machine word size (in bytes) */ // todo: переделать на другой номер
-					  result = F(W);
-					  break;
+					result = F(W);
+					break;
 
-				case 1022:
+				case 1022: // set ticker
 					result = (ticker & FMAX);
 					ticker = fixval(a);
 					break;
 
-				case 2000:
-					result = ITRUE;
+				case 1016: { // getenv <owl-raw-bvec-or-ascii-leaf-string>
+					word *name = (word *)a;
+					if (is_string(name)) {
+						char* value = getenv((char*)&name[1]);
+						if (value)
+							result = (word) new_string(lenn(value, FMAX), value);
+					}
 					break;
-
+				}
+				case 1117: { // get memory stats -> (list generation fp total)
+					int g = heap->genstart - heap->begin;
+					int f = fp - heap->begin;
+					int t = heap->end - heap->begin;
+					result = (word) new_list(TPAIR, F(g), F(f), F(t));
+					break;
+				}
 
 #if HAS_DLOPEN
 				// -=( dlopen )=-------------------------------------------------
@@ -2613,15 +2693,6 @@ invoke:; // nargs and regs ready, maybe gc and execute ob
 				}*/
 #endif
 
-				case 1016: { // getenv <owl-raw-bvec-or-ascii-leaf-string>
-					word *name = (word *)a;
-					if (is_string(name)) {
-						char* value = getenv((char*)&name[1]);
-						if (value)
-							result = (word) new_string(lenn(value, FMAX), value);
-					}
-					break;
-				}
 
 				default: {
 					word prim_sys(int op, word a, word b, word c) {
@@ -3011,7 +3082,7 @@ int main(int argc, char** argv)
 	AllocConsole();
 #endif
 
-	//set_signal_handler();
+	set_signal_handler();
 	OL* olvm = OL_new(bootstrap, bootstrap != language ? free : NULL);
 	void* r = OL_eval(olvm, argc, argv);
 	OL_free(olvm);
@@ -3227,7 +3298,7 @@ int vm_feof(OL* vm)
 #if HAS_PINVOKE
 __attribute__
 	((__visibility__("default")))
-word pinvoke(OL* self, word arguments)
+word pinvoke(OL* self, word* arguments)
 {
 	heap_t* heap = &self->heap;
 	// get memory pointer
@@ -3460,9 +3531,9 @@ word pinvoke(OL* self, word arguments)
 	// a - function address
 	// b - arguments (may be pair with req type in car and arg in cdr - not yet done)
 	// c - '(return-type . argument-types-list)
-	word* A = (word*)car(arguments); arguments = cdr(arguments); // function
-	word* B = (word*)car(arguments); arguments = cdr(arguments); // rtty
-	word* C = (word*)car(arguments); arguments = cdr(arguments); // args
+	word* A = (word*)car(arguments); arguments = (word*)cdr(arguments); // function
+	word* B = (word*)car(arguments); arguments = (word*)cdr(arguments); // rtty
+	word* C = (word*)car(arguments); arguments = (word*)cdr(arguments); // args
 
 //	assert(hdrtype(A[0]) == TPORT, A, 1032);
 	assert ((word)B != INULL && hdrtype(B[0]) == TPAIR);
@@ -3682,7 +3753,7 @@ word pinvoke(OL* self, word arguments)
 	got = call(returntype >> 8, args, i);
 #endif
 
-	word result;
+	word result = IFALSE;
 	switch (returntype & 0x3F) {
 		case TINT:
 			if (got > FMAX) {
@@ -3723,7 +3794,7 @@ word pinvoke(OL* self, word arguments)
 
 __attribute__
 	((__visibility__("default")))
-word testcall(OL* self, word arguments)
+word testcall(OL* self, word* arguments)
 {
 	fprintf(stderr, "testcall>: fp=%p\n", self->heap.fp);
 	self->gc(256);

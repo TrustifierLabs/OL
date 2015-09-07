@@ -4,7 +4,7 @@ export PATH := .:$(PATH)
 
 PREFIX := /usr
 FAILED := $(shell mktemp -u)
-CFLAGS += -std=c99 -O3 -DNDEBUG
+CFLAGS += -std=c99 -O2 -DNDEBUG
 boot.c := bootstrap~
 repl.o := src/repl.o
 
@@ -13,6 +13,7 @@ all: ol
 clean:
 	rm -f boot.fasl
 	rm -f $(repl.o)
+	rm -f ./vm ./ol
 
 install: ol repl
 	install -d /usr/lib/ol
